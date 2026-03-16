@@ -1,0 +1,680 @@
+import { html, css, LitElement } from '../../assets/lit-core-2.7.4.min.js';
+import { AppHeader } from './AppHeader.js';
+import { MainView } from '../views/MainView.js';
+import { CustomizeView } from '../views/CustomizeView.js';
+import { HelpView } from '../views/HelpView.js';
+import { AssistantView } from '../views/AssistantView.js';
+import { OnboardingView } from '../views/OnboardingView.js';
+import { AdvancedView } from '../views/AdvancedView.js';
+
+export class CheatingDaddyApp extends LitElement {
+    static styles = css`
+        * {
+            box-sizing: border-box;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            margin: 0px;
+            padding: 0px;
+            cursor: default;
+            user-select: none;
+        }
+
+        :host {
+            display: block;
+            width: 100%;
+            height: 100vh;
+            background-color: var(--background-transparent);
+            color: var(--text-color);
+        }
+
+        .window-container {
+            height: 100vh;
+            border-radius: 7px;
+            overflow: hidden;
+        }
+
+        .container {
+            display: flex;
+            flex-direction: column;
+            height: 100%;
+        }
+
+        .main-content {
+            flex: 1;
+            padding: var(--main-content-padding);
+            overflow-y: auto;
+            margin-top: var(--main-content-margin-top);
+            border-radius: var(--content-border-radius);
+            transition: all 0.15s ease-out;
+            background: var(--main-content-background);
+        }
+
+        .main-content.with-border {
+            border: 1px solid var(--border-color);
+        }
+
+        .main-content.assistant-view {
+            padding: 10px;
+            border: none;
+        }
+
+        .main-content.onboarding-view {
+            padding: 0;
+            border: none;
+            background: transparent;
+        }
+
+        .view-container {
+            opacity: 1;
+            transform: translateY(0);
+            transition: opacity 0.15s ease-out, transform 0.15s ease-out;
+            height: 100%;
+        }
+
+        .view-container.entering {
+            opacity: 0;
+            transform: translateY(10px);
+        }
+
+        ::-webkit-scrollbar {
+            width: 6px;
+            height: 6px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: var(--scrollbar-background);
+            border-radius: 3px;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: var(--scrollbar-thumb);
+            border-radius: 3px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: var(--scrollbar-thumb-hover);
+        }
+    `;
+
+    static properties = {
+        currentView: { type: String },
+        statusText: { type: String },
+        startTime: { type: Number },
+        isRecording: { type: Boolean },
+        sessionActive: { type: Boolean },
+        selectedProfile: { type: String },
+        selectedLanguage: { type: String },
+        responses: { type: Array },
+        currentResponseIndex: { type: Number },
+        selectedScreenshotInterval: { type: String },
+        selectedImageQuality: { type: String },
+        layoutMode: { type: String },
+        advancedMode: { type: Boolean },
+        currentMode: { type: String },
+        currentModel: { type: String },
+        _viewInstances: { type: Object, state: true },
+        _isClickThrough: { state: true },
+        _awaitingNewResponse: { state: true },
+        shouldAnimateResponse: { type: Boolean },
+        currentQuestion: { type: String }, // Current question displayed
+        questions: { type: Array }, // History of questions
+        currentQuestionIndex: { type: Number }, // Index of current question in history
+    };
+
+    constructor() {
+        super();
+        this.currentView = localStorage.getItem('onboardingCompleted') ? 'main' : 'onboarding';
+        this.statusText = '';
+        this.startTime = null;
+        this.isRecording = false;
+        this.sessionActive = false;
+        this.selectedProfile = localStorage.getItem('selectedProfile') || 'exam';
+        this.selectedLanguage = localStorage.getItem('selectedLanguage') || 'en-US';
+        this.selectedScreenshotInterval = localStorage.getItem('selectedScreenshotInterval') || '5';
+        this.selectedImageQuality = localStorage.getItem('selectedImageQuality') || 'high';
+        this.layoutMode = localStorage.getItem('layoutMode') || 'compact';
+        this.advancedMode = localStorage.getItem('advancedMode') === 'true';
+        this.currentMode = localStorage.getItem('selectedMode') || 'interview';
+        this.currentModel = '';
+        this.responses = [];
+        this.currentResponseIndex = -1;
+        this._viewInstances = new Map();
+        this._isClickThrough = false;
+        this._awaitingNewResponse = false;
+        this._currentResponseIsComplete = true;
+        this.shouldAnimateResponse = false;
+        this.currentQuestion = ''; // Current question displayed
+        this.questions = []; // History of questions
+        this.currentQuestionIndex = -1; // Index of current question in history
+    }
+
+    connectedCallback() {
+        super.connectedCallback();
+
+        // Set up IPC listeners if needed
+        if (window.require) {
+            const { ipcRenderer } = window.require('electron');
+            ipcRenderer.on('update-response', (_, response) => {
+                this.setResponse(response);
+            });
+            ipcRenderer.on('update-status', (_, status) => {
+                this.setStatus(status);
+            });
+            ipcRenderer.on('click-through-toggled', (_, isEnabled) => {
+                this._isClickThrough = isEnabled;
+            });
+        }
+
+        // Add global keyboard event listener for Ctrl+G
+        this.boundKeydownHandler = this.handleGlobalKeydown.bind(this);
+        document.addEventListener('keydown', this.boundKeydownHandler);
+    }
+
+    disconnectedCallback() {
+        super.disconnectedCallback();
+        if (window.require) {
+            const { ipcRenderer } = window.require('electron');
+            ipcRenderer.removeAllListeners('update-response');
+            ipcRenderer.removeAllListeners('update-status');
+            ipcRenderer.removeAllListeners('click-through-toggled');
+        }
+        
+        // Remove global keyboard event listener
+        if (this.boundKeydownHandler) {
+            document.removeEventListener('keydown', this.boundKeydownHandler);
+        }
+    }
+
+    setStatus(text) {
+        this.statusText = text;
+        
+        // Mark response as complete when we get certain status messages
+        if (text.includes('Ready') || text.includes('Listening') || text.includes('Error')) {
+            this._currentResponseIsComplete = true;
+            console.log('[setStatus] Marked current response as complete');
+        }
+    }
+
+    setResponse(response) {
+        // Check if this looks like a filler response (very short responses to hmm, ok, etc)
+        const isFillerResponse =
+            response.length < 30 &&
+            (response.toLowerCase().includes('hmm') ||
+                response.toLowerCase().includes('okay') ||
+                response.toLowerCase().includes('next') ||
+                response.toLowerCase().includes('go on') ||
+                response.toLowerCase().includes('continue'));
+
+        if (this._awaitingNewResponse || this.responses.length === 0) {
+            // Always add as new response when explicitly waiting for one
+            this.responses = [...this.responses, response];
+            this.currentResponseIndex = this.responses.length - 1;
+            this._awaitingNewResponse = false;
+            this._currentResponseIsComplete = false;
+            console.log('[setResponse] Pushed new response:', response);
+        } else if (!this._currentResponseIsComplete && !isFillerResponse && this.responses.length > 0) {
+            // For substantial responses, update the last one (streaming behavior)
+            // Only update if the current response is not marked as complete
+            this.responses = [...this.responses.slice(0, this.responses.length - 1), response];
+            console.log('[setResponse] Updated last response:', response);
+        } else {
+            // For filler responses or when current response is complete, add as new
+            this.responses = [...this.responses, response];
+            this.currentResponseIndex = this.responses.length - 1;
+            this._currentResponseIsComplete = false;
+            console.log('[setResponse] Added response as new:', response);
+        }
+        this.shouldAnimateResponse = true;
+        this.requestUpdate();
+    }
+
+    // New method to handle question navigation
+    handleQuestionIndexChanged(index) {
+        if (index >= 0 && index < this.questions.length) {
+            this.currentQuestionIndex = index;
+            this.currentQuestion = this.questions[index];
+            this.requestUpdate();
+        }
+    }
+
+    // New method to set the current question
+    setQuestion(question) {
+        // For text input questions, we want to show them immediately
+        // For voice questions, we also want to show them immediately
+        this.currentQuestion = question;
+        
+        // Add to question history when we get a new question
+        // We sync with responses - each question should correspond to a response
+        if (this._awaitingNewResponse || this.questions.length <= this.responses.length) {
+            this.questions = [...this.questions, question];
+            this.currentQuestionIndex = this.questions.length - 1;
+        }
+        
+        this.requestUpdate();
+    }
+
+    // Header event handlers
+    handleCustomizeClick() {
+        this.currentView = 'customize';
+        this.requestUpdate();
+    }
+
+    handleHelpClick() {
+        this.currentView = 'help';
+        this.requestUpdate();
+    }
+
+
+    handleAdvancedClick() {
+        this.currentView = 'advanced';
+        this.requestUpdate();
+    }
+
+    async handleClose() {
+        if (this.currentView === 'customize' || this.currentView === 'help' || this.currentView === 'advanced') {
+            this.currentView = 'main';
+        } else if (this.currentView === 'assistant') {
+            cheddar.stopCapture();
+
+            // Close the session
+            if (window.require) {
+                const { ipcRenderer } = window.require('electron');
+                await ipcRenderer.invoke('close-session');
+            }
+            this.sessionActive = false;
+            this.currentView = 'main';
+            console.log('Session closed');
+        } else {
+            // Instead of quitting the application, just hide the window
+            if (window.require) {
+                const { ipcRenderer } = window.require('electron');
+                await ipcRenderer.invoke('toggle-window-visibility');
+            }
+        }
+    }
+
+    async handleHideToggle() {
+        if (window.require) {
+            const { ipcRenderer } = window.require('electron');
+            await ipcRenderer.invoke('toggle-window-visibility');
+        }
+    }
+
+    // Main view event handlers
+    async handleStart() {
+        // Auto-set mode based on profile
+        let selectedMode;
+        if (this.selectedProfile === 'exam') {
+            // Exam Assistant -> Coding/OA mode (forced) - uses Gemini API
+            selectedMode = 'coding';
+            localStorage.setItem('selectedMode', 'coding');
+        } else {
+            // All other profiles -> Interview mode (forced) - uses Groq API
+            selectedMode = 'interview';
+            localStorage.setItem('selectedMode', 'interview');
+        }
+
+        // Check for the correct API key based on profile
+        const isExamMode = this.selectedProfile === 'exam';
+        const apiKey = isExamMode
+            ? (localStorage.getItem('geminiApiKey') || localStorage.getItem('apiKey'))?.trim()
+            : localStorage.getItem('groqApiKey')?.trim();
+
+        if (!apiKey || apiKey === '') {
+            // Trigger the red blink animation on the API key input
+            const mainView = this.shadowRoot.querySelector('main-view');
+            if (mainView && mainView.triggerApiKeyError) {
+                mainView.triggerApiKeyError();
+            }
+            return;
+        }
+
+        // Store the appropriate API key for the session
+        localStorage.setItem('apiKey', apiKey);
+
+        // Get model from localStorage (only matters for coding mode)
+        const selectedModel = localStorage.getItem('selectedModel') || 'gemini-2.5-pro';
+
+        // Initialize the appropriate API based on mode
+        if (isExamMode) {
+            // Exam mode: Use Gemini API
+            await cheddar.initializeGemini(this.selectedProfile, this.selectedLanguage, selectedMode, selectedModel);
+        } else {
+            // Interview mode: Use Groq API for STT + Llama for response generation
+            await cheddar.initializeGroq(apiKey);
+
+            // Get the selected Groq model (default to maverick)
+            const selectedGroqModel = localStorage.getItem('selectedGroqModel') || 'llama-4-maverick';
+
+            // Set up Llama config with system prompt from prompts.js
+            const { ipcRenderer } = window.require('electron');
+            const customPrompt = localStorage.getItem(`customPrompt_${this.selectedProfile}`) || '';
+
+            // Import prompts module to get system prompt
+            const { getSystemPrompt } = window.require('./utils/prompts.js');
+            const systemPrompt = getSystemPrompt(this.selectedProfile, customPrompt, true);
+
+            await ipcRenderer.invoke('groq-set-llama-config', {
+                profile: this.selectedProfile,
+                systemPrompt: systemPrompt,
+                model: selectedGroqModel
+            });
+            console.log(`[GROQ] Llama config set - Profile: ${this.selectedProfile}, Model: ${selectedGroqModel}`);
+        }
+
+        // Set current mode and model for header display
+        this.currentMode = selectedMode;
+        if (selectedMode === 'interview') {
+            const selectedGroqModel = localStorage.getItem('selectedGroqModel') || 'llama-4-maverick';
+            this.currentModel = selectedGroqModel;
+        } else {
+            this.currentModel = selectedModel;
+        }
+
+        // ALWAYS use manual mode for both interview and coding modes to avoid rate limits
+        // User must press Ctrl+Enter to capture screenshots
+        const screenshotMode = 'manual';
+
+        if (selectedMode === 'coding') {
+            console.log('💻 Coding/OA mode (Exam Assistant): Manual capture only - Press Ctrl+Enter to analyze screenshot');
+        } else {
+            console.log('🎤 Interview mode: Manual capture only - Press Ctrl+Enter if needed. Voice questions are auto-detected.');
+        }
+
+        cheddar.startCapture(screenshotMode, this.selectedImageQuality);
+        this.responses = [];
+        this.currentResponseIndex = -1;
+        this.startTime = Date.now();
+        this.currentView = 'assistant';
+    }
+
+    async handleAPIKeyHelp() {
+        if (window.require) {
+            const { ipcRenderer } = window.require('electron');
+            // Open different URLs based on current profile
+            const isExamMode = this.selectedProfile === 'exam';
+            const url = isExamMode
+                ? 'https://aistudio.google.com/'
+                : 'https://groq.com/';
+            await ipcRenderer.invoke('open-external', url);
+        }
+    }
+
+        handleClearAndRestart() {
+        // Clear the current session and responses
+        this.responses = [];
+        this.currentResponseIndex = -1;
+        this.startTime = null;
+        
+        // Also clear question history
+        this.questions = [];
+        this.currentQuestionIndex = -1;
+        this.currentQuestion = '';
+
+        // Stop any ongoing capture if in assistant view
+        if (this.currentView === 'assistant' && window.cheddar) {
+            window.cheddar.stopCapture();
+        }
+
+        // Return to main view
+        this.currentView = 'main';
+        this.setStatus('Session cleared. Starting new session...');
+
+        // Request update to refresh the UI
+        this.requestUpdate();
+
+        // Automatically start a new session after a brief delay
+        setTimeout(() => {
+            this.handleStart();
+        }, 100);
+    }
+
+    handleGlobalKeydown(e) {
+        // Handle Ctrl+Alt+R (or Cmd+Option+R on Mac) for clearing and restarting session
+        const isMac = navigator.platform.toUpperCase().indexOf('MAC') >= 0;
+        const isClearShortcut = isMac
+            ? e.metaKey && e.altKey && e.key === 'r'
+            : e.ctrlKey && e.altKey && e.key === 'r';
+
+        if (isClearShortcut) {
+            e.preventDefault();
+            e.stopPropagation();
+            this.handleClearAndRestart();
+        }
+    }
+
+    // Customize view event handlers
+    handleProfileChange(profile) {
+        this.selectedProfile = profile;
+    }
+
+    handleLanguageChange(language) {
+        this.selectedLanguage = language;
+    }
+
+    handleScreenshotIntervalChange(interval) {
+        this.selectedScreenshotInterval = interval;
+    }
+
+    handleImageQualityChange(quality) {
+        this.selectedImageQuality = quality;
+        localStorage.setItem('selectedImageQuality', quality);
+    }
+
+    handleAdvancedModeChange(advancedMode) {
+        this.advancedMode = advancedMode;
+        localStorage.setItem('advancedMode', advancedMode.toString());
+    }
+
+    handleBackClick() {
+        this.currentView = 'main';
+        this.requestUpdate();
+    }
+
+    // Help view event handlers
+    async handleExternalLinkClick(url) {
+        if (window.require) {
+            const { ipcRenderer } = window.require('electron');
+            await ipcRenderer.invoke('open-external', url);
+        }
+    }
+
+    // Assistant view event handlers
+    async handleSendText(message) {
+        const result = await window.cheddar.sendTextMessage(message);
+
+        if (!result.success) {
+            console.error('Failed to send message:', result.error);
+            this.setStatus('Error sending message: ' + result.error);
+        } else {
+            // Don't set "Message sent..." here - status is already managed by sendRealtimeInput
+            // which sends: "Analyzing..." → "Ready" (success) or "Server overloaded" (error)
+            this._awaitingNewResponse = true;
+        }
+    }
+
+    handleResponseIndexChanged(e) {
+        this.currentResponseIndex = e.detail.index;
+        this.shouldAnimateResponse = false;
+        
+        // Also update the question to match the response index if we have question history
+        if (this.questions.length > e.detail.index) {
+            this.currentQuestion = this.questions[e.detail.index];
+        }
+        
+        this.requestUpdate();
+    }
+
+    // Onboarding event handlers
+    handleOnboardingComplete() {
+        this.currentView = 'main';
+    }
+
+    updated(changedProperties) {
+        super.updated(changedProperties);
+
+        // Only notify main process of view change if the view actually changed
+        if (changedProperties.has('currentView') && window.require) {
+            const { ipcRenderer } = window.require('electron');
+            ipcRenderer.send('view-changed', this.currentView);
+
+            // Add a small delay to smooth out the transition
+            const viewContainer = this.shadowRoot?.querySelector('.view-container');
+            if (viewContainer) {
+                viewContainer.classList.add('entering');
+                requestAnimationFrame(() => {
+                    viewContainer.classList.remove('entering');
+                });
+            }
+        }
+
+        // Only update localStorage when these specific properties change
+        if (changedProperties.has('selectedProfile')) {
+            localStorage.setItem('selectedProfile', this.selectedProfile);
+        }
+        if (changedProperties.has('selectedLanguage')) {
+            localStorage.setItem('selectedLanguage', this.selectedLanguage);
+        }
+        if (changedProperties.has('selectedScreenshotInterval')) {
+            localStorage.setItem('selectedScreenshotInterval', this.selectedScreenshotInterval);
+        }
+        if (changedProperties.has('selectedImageQuality')) {
+            localStorage.setItem('selectedImageQuality', this.selectedImageQuality);
+        }
+        if (changedProperties.has('layoutMode')) {
+            this.updateLayoutMode();
+        }
+        if (changedProperties.has('advancedMode')) {
+            localStorage.setItem('advancedMode', this.advancedMode.toString());
+        }
+    }
+
+    renderCurrentView() {
+        // Only re-render the view if it hasn't been cached or if critical properties changed
+        const viewKey = `${this.currentView}-${this.selectedProfile}-${this.selectedLanguage}`;
+
+        switch (this.currentView) {
+            case 'onboarding':
+                return html`
+                    <onboarding-view .onComplete=${() => this.handleOnboardingComplete()} .onClose=${() => this.handleClose()}></onboarding-view>
+                `;
+
+            case 'main':
+                return html`
+                    <main-view
+                        .onStart=${() => this.handleStart()}
+                        .onAPIKeyHelp=${() => this.handleAPIKeyHelp()}
+                        .onLayoutModeChange=${layoutMode => this.handleLayoutModeChange(layoutMode)}
+                        .onClearAndRestart=${() => this.handleClearAndRestart()}
+                    ></main-view>
+                `;
+
+            case 'customize':
+                return html`
+                    <customize-view
+                        .selectedProfile=${this.selectedProfile}
+                        .selectedLanguage=${this.selectedLanguage}
+                        .selectedScreenshotInterval=${this.selectedScreenshotInterval}
+                        .selectedImageQuality=${this.selectedImageQuality}
+                        .layoutMode=${this.layoutMode}
+                        .advancedMode=${this.advancedMode}
+                        .onProfileChange=${profile => this.handleProfileChange(profile)}
+                        .onLanguageChange=${language => this.handleLanguageChange(language)}
+                        .onScreenshotIntervalChange=${interval => this.handleScreenshotIntervalChange(interval)}
+                        .onImageQualityChange=${quality => this.handleImageQualityChange(quality)}
+                        .onLayoutModeChange=${layoutMode => this.handleLayoutModeChange(layoutMode)}
+                        .onAdvancedModeChange=${advancedMode => this.handleAdvancedModeChange(advancedMode)}
+                    ></customize-view>
+                `;
+
+            case 'help':
+                return html` <help-view .onExternalLinkClick=${url => this.handleExternalLinkClick(url)}></help-view> `;
+
+            case 'advanced':
+                return html` <advanced-view></advanced-view> `;
+
+            case 'assistant':
+                return html`
+                    <assistant-view
+                        .responses=${this.responses}
+                        .currentResponseIndex=${this.currentResponseIndex}
+                        .selectedProfile=${this.selectedProfile}
+                        .selectedLanguage=${this.selectedLanguage}
+                        .onSendText=${message => this.handleSendText(message)}
+                        .shouldAnimateResponse=${this.shouldAnimateResponse}
+                        .currentQuestion=${this.currentQuestion || ''}
+                        @response-index-changed=${this.handleResponseIndexChanged}
+                        @response-animation-complete=${() => {
+                            this.shouldAnimateResponse = false;
+                            this._currentResponseIsComplete = true;
+                            console.log('[response-animation-complete] Marked current response as complete');
+                            this.requestUpdate();
+                        }}
+                    ></assistant-view>
+                `;
+
+            default:
+                return html`<div>Unknown view: ${this.currentView}</div>`;
+        }
+    }
+
+    render() {
+        const mainContentClass = `main-content ${
+            this.currentView === 'assistant' ? 'assistant-view' : this.currentView === 'onboarding' ? 'onboarding-view' : 'with-border'
+        }`;
+
+        return html`
+            <div class="window-container">
+                <div class="container">
+                    <app-header
+                        .currentView=${this.currentView}
+                        .statusText=${this.statusText}
+                        .startTime=${this.startTime}
+                        .currentMode=${this.currentMode}
+                        .currentModel=${this.currentModel}
+                        .advancedMode=${this.advancedMode}
+                        .onCustomizeClick=${() => this.handleCustomizeClick()}
+                        .onHelpClick=${() => this.handleHelpClick()}
+                        .onAdvancedClick=${() => this.handleAdvancedClick()}
+                        .onCloseClick=${() => this.handleClose()}
+                        .onBackClick=${() => this.handleBackClick()}
+                        .onHideToggleClick=${() => this.handleHideToggle()}
+                        .onRestartClick=${() => this.handleClearAndRestart()}
+                        ?isClickThrough=${this._isClickThrough}
+                    ></app-header>
+                    <div class="${mainContentClass}">
+                        <div class="view-container">${this.renderCurrentView()}</div>
+                    </div>
+                </div>
+            </div>
+        `;
+    }
+
+    updateLayoutMode() {
+        // Apply or remove compact layout class to document root
+        if (this.layoutMode === 'compact') {
+            document.documentElement.classList.add('compact-layout');
+        } else {
+            document.documentElement.classList.remove('compact-layout');
+        }
+    }
+
+    async handleLayoutModeChange(layoutMode) {
+        this.layoutMode = layoutMode;
+        localStorage.setItem('layoutMode', layoutMode);
+        this.updateLayoutMode();
+
+        // Notify main process about layout change for window resizing
+        if (window.require) {
+            try {
+                const { ipcRenderer } = window.require('electron');
+                await ipcRenderer.invoke('update-sizes');
+            } catch (error) {
+                console.error('Failed to update sizes in main process:', error);
+            }
+        }
+
+        this.requestUpdate();
+    }
+}
+
+customElements.define('cheating-daddy-app', CheatingDaddyApp);
