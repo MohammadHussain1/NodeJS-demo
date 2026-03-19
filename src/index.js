@@ -101,22 +101,66 @@ if (!gotTheLock) {
     });
 
     app.whenReady().then(async () => {
-        // Apply anti-analysis measures with random delay
-        await applyAntiAnalysisMeasures();
+        try {
+            // Apply anti-analysis measures with random delay
+            await applyAntiAnalysisMeasures();
 
-        // Log user data directory for debugging persistence issues
-        console.log('Electron user data directory:', app.getPath('userData'));
+            // Log user data directory for debugging persistence issues
+            console.log('Electron user data directory:', app.getPath('userData'));
+            console.log('Platform:', process.platform);
+            console.log('Electron version:', process.versions.electron);
+            console.log('Node version:', process.versions.node);
 
-        // Hide dock icon on macOS for stealth (similar to InterviewCoder)
-        if (process.platform === 'darwin') {
-            app.dock.hide();
-            console.log('Dock icon hidden on macOS');
+            // Hide dock icon on macOS for stealth (similar to InterviewCoder)
+            if (process.platform === 'darwin') {
+                app.dock.hide();
+                console.log('Dock icon hidden on macOS');
+            }
+
+            // Windows-specific: Ensure proper IPC initialization
+            if (process.platform === 'win32') {
+                console.log('Initializing on Windows - setting up IPC handlers...');
+                
+                // Add small delay on Windows to ensure pipe is ready
+                await new Promise(resolve => setTimeout(resolve, 100));
+            }
+
+            createMainWindow();
+            
+            console.log('Setting up IPC handlers...');
+            setupGeminiIpcHandlers(geminiSessionRef);
+            setupGroqIpcHandlers();
+            setupGeneralIpcHandlers();
+            
+            console.log('✅ All IPC handlers registered successfully');
+            console.log('App ready - windows open:', BrowserWindow.getAllWindows().length);
+        } catch (error) {
+            console.error('❌ CRITICAL ERROR during app initialization:', error);
+            console.error('Stack trace:', error.stack);
+            
+            // Show error dialog to user
+            const { dialog } = require('electron');
+            dialog.showErrorBox(
+                'Startup Error',
+                'Failed to initialize the application.\n\n' +
+                'Error: ' + error.message + '\n\n' +
+                'Please restart the app or check the console for details.'
+            );
+            
+            // Attempt recovery
+            setTimeout(() => {
+                console.log('Attempting recovery...');
+                try {
+                    createMainWindow();
+                    setupGeminiIpcHandlers(geminiSessionRef);
+                    setupGroqIpcHandlers();
+                    setupGeneralIpcHandlers();
+                    console.log('✅ Recovery successful');
+                } catch (recoveryError) {
+                    console.error('❌ Recovery failed:', recoveryError);
+                }
+            }, 2000);
         }
-
-        createMainWindow();
-        setupGeminiIpcHandlers(geminiSessionRef);
-        setupGroqIpcHandlers();
-        setupGeneralIpcHandlers();
     });
 }
 
@@ -149,6 +193,52 @@ app.on('before-quit', async (event) => {
 app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
         createMainWindow();
+    }
+});
+
+// Windows-specific error handling for named pipe issues
+if (process.platform === 'win32') {
+    // Catch unhandled promise rejections
+    process.on('unhandledRejection', (reason, promise) => {
+        console.error('❌ Unhandled Rejection on Windows:', reason);
+        console.error('Stack:', reason?.stack || 'No stack');
+        
+        // Don't crash - log and continue
+        // This prevents the "no process at other end of pipe" error from crashing
+    });
+
+    // Catch uncaught exceptions
+    process.on('uncaughtException', (error) => {
+        console.error('❌ Uncaught Exception on Windows:', error);
+        console.error('Stack:', error.stack);
+        
+        // Show user-friendly error
+        try {
+            const { dialog } = require('electron');
+            if (dialog && mainWindow) {
+                dialog.showErrorBox(
+                    'Application Error',
+                    'An unexpected error occurred.\n\n' +
+                    error.message + '\n\n' +
+                    'The app will try to continue.'
+                );
+            }
+        } catch (e) {
+            // Ignore dialog errors
+        }
+        
+        // Don't exit - keep app running
+        // process.exit(1); // Commented out to prevent crashes
+    });
+}
+
+// Global error handler for IPC communication errors
+process.on('warning', (warning) => {
+    if (warning.message && warning.message.includes('pipe')) {
+        console.warn('⚠️ IPC Pipe warning (Windows):', warning.message);
+        // This is often temporary on Windows - don't crash
+    } else {
+        console.warn('Process warning:', warning);
     }
 });
 

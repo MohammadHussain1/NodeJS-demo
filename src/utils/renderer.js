@@ -441,7 +441,11 @@ async function startCapture(screenshotIntervalSeconds = 5, imageQuality = 'mediu
                     
                     console.log('🎤 Microphone enabled - will capture interviewer through speakers');
                     console.log('💡 Tip: Use headphones to prevent echo feedback');
-                    cheddar.setStatus('Microphone mode (corporate)');
+                    
+                    // Safe status update
+                    if (typeof cheddar !== 'undefined' && cheddar.setStatus) {
+                        cheddar.setStatus('Microphone mode (corporate)');
+                    }
                     
                     // Setup audio processing optimized for microphone input
                     setupMicrophoneProcessing();
@@ -449,7 +453,13 @@ async function startCapture(screenshotIntervalSeconds = 5, imageQuality = 'mediu
                 } catch (micError) {
                     console.error('❌ Microphone access denied:', micError);
                     console.error('Error details:', micError.message);
-                    cheddar.setStatus('No audio - check permissions');
+                    
+                    // Safe status update - only if cheddar is available
+                    if (typeof cheddar !== 'undefined' && cheddar.setStatus) {
+                        cheddar.setStatus('No audio - check permissions');
+                    } else {
+                        console.warn('Cheddar not available, skipping status update');
+                    }
                     
                     // Show user-friendly guidance
                     setTimeout(() => {
@@ -466,7 +476,14 @@ async function startCapture(screenshotIntervalSeconds = 5, imageQuality = 'mediu
                 
             } catch (err) {
                 console.error('❌ Screen capture failed:', err);
-                cheddar.setStatus('Capture failed');
+                
+                // Safe status update - only if cheddar is available
+                if (typeof cheddar !== 'undefined' && cheddar.setStatus) {
+                    cheddar.setStatus('Capture failed');
+                } else {
+                    console.warn('Cheddar not available, skipping status update');
+                }
+                
                 throw err;
             }
         }
