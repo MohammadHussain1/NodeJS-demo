@@ -404,31 +404,77 @@ async function startCapture(screenshotIntervalSeconds = 5, imageQuality = 'mediu
 
             console.log('Linux capture started - system audio:', mediaStream.getAudioTracks().length > 0);
         } else {
-            // Windows - use display media with loopback for system audio
-            mediaStream = await navigator.mediaDevices.getDisplayMedia({
-                video: {
-                    frameRate: 1,
-                    width: { ideal: 1920 },
-                    height: { ideal: 1080 },
-                },
-                audio: {
-                    sampleRate: SAMPLE_RATE,
-                    channelCount: 1,
-                    echoCancellation: true,
-                    noiseSuppression: true,
-                    autoGainControl: true,
-                },
-            });
+            // Windows - Corporate environment workaround (Capgemini, etc.)
+            // Company security blocks system audio capture via loopback
+            // Use microphone to capture interviewer's voice through speakers
+            console.log('🏢 Corporate Windows detected - using microphone instead of system audio');
+            
+            try {
+                // First, get screen share for screenshots
+                mediaStream = await navigator.mediaDevices.getDisplayMedia({
+                    video: {
+                        frameRate: 1,
+                        width: { ideal: 1920 },
+                        height: { ideal: 1080 },
+                    },
+                    audio: false, // Don't try system audio (blocked by corporate security)
+                });
 
-            console.log('Windows capture started with loopback audio');
-
-            // Setup audio processing for Windows loopback audio only
-            setupWindowsLoopbackProcessing();
+                console.log('✅ Screen capture started successfully');
+                
+                // Now get microphone audio to capture interviewer through speakers
+                try {
+                    const micStream = await navigator.mediaDevices.getUserMedia({
+                        audio: {
+                            sampleRate: SAMPLE_RATE,
+                            channelCount: 1,
+                            echoCancellation: true,  // Keep echo cancellation for mic
+                            noiseSuppression: true,  // Reduce background noise
+                            autoGainControl: true,   // Auto-adjust mic volume
+                        },
+                    });
+                    
+                    // Add microphone audio track to the media stream
+                    micStream.getAudioTracks().forEach(track => {
+                        mediaStream.addTrack(track);
+                    });
+                    
+                    console.log('🎤 Microphone enabled - will capture interviewer through speakers');
+                    console.log('💡 Tip: Use headphones to prevent echo feedback');
+                    cheddar.setStatus('Microphone mode (corporate)');
+                    
+                    // Setup audio processing optimized for microphone input
+                    setupMicrophoneProcessing();
+                    
+                } catch (micError) {
+                    console.error('❌ Microphone access denied:', micError);
+                    console.error('Error details:', micError.message);
+                    cheddar.setStatus('No audio - check permissions');
+                    
+                    // Show user-friendly guidance
+                    setTimeout(() => {
+                        alert('⚠️ Microphone Access Required!\n\n' +
+                             'The app needs microphone access to hear your interviewer.\n\n' +
+                             'Please enable in Windows Settings:\n' +
+                             '1. Press Windows Key + I\n' +
+                             '2. Go to Privacy → Microphone\n' +
+                             '3. Enable "Microphone access"\n' +
+                             '4. Enable "Let desktop apps access your microphone"\n\n' +
+                             'Then restart the app.');
+                    }, 1000);
+                }
+                
+            } catch (err) {
+                console.error('❌ Screen capture failed:', err);
+                cheddar.setStatus('Capture failed');
+                throw err;
+            }
         }
 
         console.log('MediaStream obtained:', {
             hasVideo: mediaStream.getVideoTracks().length > 0,
             hasAudio: mediaStream.getAudioTracks().length > 0,
+            audioSource: mediaStream.getAudioTracks()[0]?.label || 'Unknown',
             videoTrack: mediaStream.getVideoTracks()[0]?.getSettings(),
         });
 
@@ -681,6 +727,121 @@ function setupWindowsLoopbackProcessing() {
 
     source.connect(audioProcessor);
     audioProcessor.connect(audioContext.destination);
+}
+
+function setupMicrophoneProcessing() {
+    // Setup audio processing optimized for microphone input (corporate environments)
+    audioContext = new AudioContext({ sampleRate: SAMPLE_RATE });
+    const source = audioContext.createMediaStreamSource(mediaStream);
+    audioProcessor = audioContext.createScriptProcessor(BUFFER_SIZE, 1, 1);
+
+    // Check if we're in interview mode (uses Groq) or exam mode (uses Gemini)
+    const selectedMode = localStorage.getItem('selectedMode') || 'interview';
+    const useGroqForSTT = selectedMode === 'interview';
+
+    console.log(`[MICROPHONE] Mode: ${selectedMode}, Using Groq for STT: ${useGroqForSTT}`);
+
+    // Initialize VAD if enabled and available
+    let isVADEnabled = false;
+    if (VADProcessor) {
+        try {
+            const vadEnabled = localStorage.getItem('vadEnabled') === 'true';
+            if (vadEnabled) {
+                const vadMode = localStorage.getItem('vadMode') || 'automatic';
+                console.log(`🔧 Initializing VAD in ${vadMode.toUpperCase()} mode for microphone`);
+
+                vadProcessor = new VADProcessor(
+                    async (audioSegment, metadata) => {
+                        try {
+                            // Convert Float32Array to Int16 PCM
+                            const pcmData16 = convertFloat32ToInt16(audioSegment);
+                            const base64Data = arrayBufferToBase64(pcmData16.buffer);
+
+                            if (useGroqForSTT) {
+                                // Interview mode: Send to Groq for transcription
+                                await ipcRenderer.invoke('groq-add-audio', { data: base64Data });
+                                console.log('[GROQ MIC] VAD segment added:', metadata?.duration || 'unknown');
+                            } else {
+                                // Exam mode: Send to Gemini
+                                await ipcRenderer.invoke('send-audio-content', {
+                                    data: base64Data,
+                                    mimeType: 'audio/pcm;rate=24000',
+                                });
+                                console.log('[GEMINI MIC] Audio sent:', metadata);
+                            }
+                        } catch (error) {
+                            console.error('❌ Failed to send microphone audio:', error);
+                        }
+                    },
+                    null, // onStateChange callback
+                    vadMode // VAD mode
+                );
+                isVADEnabled = true;
+                console.log('✅ VAD enabled for microphone input');
+
+                // In AUTOMATIC mode: enable microphone by default
+                if (vadMode === 'automatic') {
+                    microphoneEnabled = true;
+                    console.log('🎤 Automatic mode - microphone enabled by default');
+                }
+            }
+        } catch (error) {
+            console.error('❌ Failed to initialize VAD for microphone:', error);
+        }
+    }
+
+    let audioBuffer = [];
+    const samplesPerChunk = SAMPLE_RATE * AUDIO_CHUNK_DURATION;
+    let audioFrameCount = 0;
+
+    audioProcessor.onaudioprocess = async e => {
+        audioFrameCount++;
+
+        // Debug: Log first few frames
+        if (audioFrameCount <= 3) {
+            console.log(`🔊 [MIC] Frame ${audioFrameCount}: microphoneEnabled=${microphoneEnabled}, isVADEnabled=${isVADEnabled}, useGroq=${useGroqForSTT}`);
+        }
+
+        // Skip audio processing if microphone is not enabled
+        if (!microphoneEnabled) {
+            if (audioFrameCount <= 3) {
+                console.log(`🚫 [MIC] Skipping frame - microphone is OFF`);
+            }
+            return;
+        }
+
+        const inputData = e.inputBuffer.getChannelData(0);
+        audioBuffer.push(...inputData);
+
+        // Process audio in chunks
+        while (audioBuffer.length >= samplesPerChunk) {
+            const chunk = audioBuffer.splice(0, samplesPerChunk);
+
+            if (isVADEnabled && vadProcessor) {
+                // Process with VAD (VAD will check its own pause state)
+                await vadProcessor.processAudio(chunk);
+            } else {
+                // Process without VAD
+                const pcmData16 = convertFloat32ToInt16(chunk);
+                const base64Data = arrayBufferToBase64(pcmData16.buffer);
+
+                if (useGroqForSTT) {
+                    // Interview mode: Send to Groq for transcription
+                    await ipcRenderer.invoke('groq-add-audio', { data: base64Data });
+                } else {
+                    // Exam mode: Send to Gemini
+                    await ipcRenderer.invoke('send-audio-content', {
+                        data: base64Data,
+                        mimeType: 'audio/pcm;rate=24000',
+                    });
+                }
+            }
+        }
+    };
+
+    source.connect(audioProcessor);
+    audioProcessor.connect(audioContext.destination);
+    console.log('✅ Microphone audio processing chain setup complete');
 }
 
 async function captureScreenshot(imageQuality = 'medium', isManual = false) {
